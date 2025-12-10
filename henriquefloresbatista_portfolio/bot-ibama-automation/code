@@ -1,0 +1,571 @@
+import os
+import time
+import threading
+import keyboard 
+import random
+from exceptions import *
+import pyautogui
+import pyperclip
+import pandas as pd
+from pyautogui import ImageNotFoundException
+import psutil
+import subprocess
+import cv2
+from pyautogui import FailSafeException
+from log import Log
+import wget
+from janela_selecao_data import JanelaSelecaoDatas
+from PyQt5.QtWidgets import QApplication , QMessageBox, QWidget
+import sys
+from datetime import datetime
+from view import View
+class BotIbamaGui:
+    def __init__(self) -> None:
+        """
+        Inicializa o robô, configura variáveis, caminhos, mapas de tela e inicia as threads de escuta de teclas.
+        """
+        self.df = None
+        self.emitir_cerificado = 'https://servicos.ibama.gov.br/ctf/sistema.php?moduloId=9'
+        self.url_home = 'https://servicos.ibama.gov.br/ctf/sistema.php'
+        self.url_target = 'https://servicos.ibama.gov.br/ctf/modulos/certificadoregistro/emissao_certf_regul_pj.php'
+        self.url_logout = 'https://servicos.ibama.gov.br/ctf/logout.php'
+
+        self.flag_logado = True
+        self.path_out_files = None
+        self.path_ultimo_certificado = None
+        self.driver = None
+        self.process = None
+
+        self.flag_captcha = False
+        self.flag_stop = False
+
+        self.map_screen = {
+            'input_user': 'images/input_img_user.png',
+            'icon_hcaptcha': 'images/sistema_imagem.png',
+            'btn_certificado': 'images/emitir_certificado.png',
+            'btn_imprimir' : 'images/imprimir_certificado.png'
+        }
+        self.log = Log()
+
+
+        # Criando e iniciando a thread
+        esc_thread = threading.Thread(target= self.esc_listener, daemon=True)
+        space_thread = threading.Thread(target= self.space_listener, daemon=True)
+        esc_thread.start()
+        space_thread.start()
+
+# ---------------------------------------------------------------------------------------------------------------
+    def esc_listener(self):
+        """
+        Thread que escuta a tecla 'Esc'. Se pressionada, ativa flag para parar o robô e registra no log.
+        """
+        print("Thread iniciada. Pressione 'Esc' para sair.")
+        while True:
+            if keyboard.is_pressed('esc'):
+                print("Tecla 'Esc' pressionada. Encerrando...")
+                self.flag_captcha = True
+                self.log.add_log(cnpj=cnpj, message='ESC', tipo='info', exec_atual=self.path_out_files)
+# ---------------------------------------------------------------------------------------------------------------
+    def dowload_certificado(self, cnpj):
+        """
+        dowload certificado
+        ---
+        função realiza o dowload do certificado utilizando piperclip e wget
+        
+        raise
+        ---
+        DowloadCertificadoException: Erro ao baixar o certificado
+        """
+        try:
+            self.action_goto_page(self.url_target)
+            pyautogui.press('f6')
+            pyautogui.hotkey('ctrl', 'a')
+            pyautogui.hotkey('ctrl', 'c')
+            url = pyperclip.paste()
+            print(f"URL do certificado: {url}")
+            pdf_path = os.path.join(self.path_out_files, f"{str(cnpj)}.pdf")
+            if not os.path.exists(self.path_out_files):
+                os.makedirs(self.path_out_files)
+            wget.download(url, out=pdf_path)
+
+            # Verifica se o arquivo foi baixado com sucesso
+            pdf_path = os.path.join(self.path_out_files, f"{str(cnpj)}.pdf")
+            if not os.path.exists(pdf_path): 
+                raise DowloadCertificadoException("Certificado não encontrado após o download.")
+            self.log.add_log(tipo='download', message=url, cnpj=cnpj, exec_atual=self.path_out_files)
+            print(f"Certificado baixado com sucesso: {pdf_path}")
+            
+            
+        except Exception as e:
+            raise DowloadCertificadoException(f"Erro ao baixar o certificado: {e}")
+            
+#---------------------------------------------------------------------------------------------------------------
+    def space_listener(self):
+        """
+        Thread que escuta a tecla 'space'. Se pressionada, ativa flag para parar o robô.
+        """
+        print("Thread iniciada. Pressione 'space' para sair.")
+        keyboard.add_hotkey('space', self.stop_bot)
+#  ---------------------------------------------------------------------------------------------------------------
+    # Método para parar o bot quando a tecla 'space' for pressionada 
+    def stop_bot(self):
+        
+        print("Tecla 'space' pressionada. Encerrando...")
+        self.flag_stop = True
+
+    def executar(self):
+        self.space_listener()
+        while not self.flag_stop:
+            print("Robô rodando...")
+            time.sleep(1)
+        print("Robô encerrado.")
+# ----------------------------------------------------------------------------------------------------------------------
+    def localizar_elemento(self, imagem, confidence=0.7, tentativas=3, intervalo=1):
+        """
+        Tenta localizar um elemento na tela por imagem, usando pyautogui.
+        Retorna o box do elemento se encontrado, ou None se não encontrar.
+        """
+        for _ in range(tentativas):
+            try:
+                box = pyautogui.locateOnScreen(imagem, confidence=confidence)
+                if box:
+                    return box
+            except pyautogui.ImageNotFoundException:
+                pass
+            time.sleep(0.3)
+         
+
+        return None
+#----------------------------------------------------------------------------------------------------------------------    
+    def verifica_progresso(self, df, lista_cnpj_emitidos):
+        """
+        Calcula o percentual de certificados emitidos e pergunta ao usuário se deseja continuar de onde parou.
+        Retorna o índice da próxima linha a ser processada ou 0 se for para começar do início.
+        """
+        flag_continuar = True
+        qtd_cnpj_emitir = len(df)
+        qtd_cnpj_emitidos = len(lista_cnpj_emitidos)
+        total = qtd_cnpj_emitir + qtd_cnpj_emitidos 
+        percentual = (qtd_cnpj_emitidos / total) * 100 if total > 0 else 0
+        view = View()
+
+       
+
+        if percentual > 0:
+            mensagem = f"Você já emitiu {qtd_cnpj_emitidos} de {total} certificados ({percentual:.2f}%).\n"
+            mensagem += "Deseja continuar de onde parou?"
+            flag_continuar = view.show_confirmation_dialog(mensagem, title="Continuar Execução")
+
+
+            if flag_continuar:
+                # Encontra o primeiro índice não emitido
+                for idx, row in df.iterrows():
+                    if row['emitido'] == 0:
+                        return idx, flag_continuar
+        return 0, flag_continuar
+# ----------------------------------------------------------------------------------------------------------------------
+    def action_login(self, CNPJ, senha):
+        """
+        Realiza o login no sistema do Ibama usando o CNPJ e senha informados.
+        Retorna True se o login foi realizado, False caso contrário.
+        """
+        flag = True
+        print('> Action login ')
+        print(CNPJ)
+        try:
+            # self.small_sleep()
+            elemento = self.map_screen['input_user']
+            box = self.localizar_elemento(elemento)   #Usando o novo método
+            if box:
+                pyautogui.click(x=box.left + 200, y=box.top + 10)
+                self.send_keys(CNPJ)
+                # self.small_sleep()
+                pyautogui.press('tab')
+                # self.small_sleep()
+                self.send_keys(senha)
+                # self.small_sleep()
+                pyautogui.press('tab')
+                # self.small_sleep()
+
+                pyautogui.press('enter')
+            else:
+                print("Não foi possível localizar o campo de usuário após várias tentativas.")
+                flag = False
+        except ImageNotFoundException as e:
+            print(f"Erro ao localizar imagem: {e}")
+            flag = False
+        print(f'\t- Sucesso {flag}')
+        pyautogui.screenshot('screenshot_erro.png')
+        return flag
+# ----------------------------------------------------------------------------------------------------------------------
+    def action_emitir_certificado(self):
+        """
+        Acessa a página de emissão de certificado no sistema do Ibama.
+
+        :return flag: True se o botão de emitir certificado foi clicado, False caso contrário.
+        :rtype bool:
+        """
+        self.action_goto_page(self.emitir_cerificado)
+        btn_certificado = self.map_screen['btn_certificado']
+        btn_imprimir_certificado = self.map_screen['btn_imprimir']
+
+        # identifica o botão de emitir o certcificado na tela
+        box = self.localizar_elemento(btn_certificado, confidence=0.7, tentativas=5, intervalo=1)
+        
+        box_imprimir = self.localizar_elemento(btn_imprimir_certificado, confidence=0.7, tentativas=5, intervalo=1)
+        if box_imprimir:
+            return True
+        
+        if box:
+            pyautogui.click(x=box.left + 10, y=box.top + 10)
+            self.small_sleep()
+            pyautogui.press('enter')
+            return True
+        return False
+
+# ----------------------------------------------------------------------------------------------------------------------
+    def open_mozilla(self):
+        """
+        Abre o navegador Mozilla Firefox em modo maximizado.
+        """
+        mozilla_path = r"C:\Program Files\Mozilla Firefox\firefox.exe"
+        self.process = subprocess.Popen([mozilla_path, "--start-maximized", "--disable-features=BookmarsBar"])
+        # Redefine o zoom para 100%
+        self.small_sleep()
+# ----------------------------------------------------------------------------------------------------------------------
+    def start_mozilla(self):
+        """
+        Inicia o Mozilla Firefox e executa uma pausa aleatória.
+        """
+        self.open_mozilla()
+        self.random_sleep()
+        # self.anonimo()
+# ----------------------------------------------------------------------------------------------------------------------
+    def close_mozilla(self):
+        """
+        Fecha o navegador Mozilla Firefox, tentando primeiro pelo processo e depois por atalhos de teclado.
+        """
+        def close_w():
+            pyautogui.keyDown('alt')
+            self.small_sleep()
+            pyautogui.press('f4')
+            self.small_sleep()
+            pyautogui.press('f4')
+            pyautogui.keyUp('alt')
+
+        if psutil.pid_exists(self.process.pid):        
+            try:
+                parent = psutil.Process(self.process.pid)
+                for child in parent.children(recursive=True):
+                    child.kill()
+                parent.kill()
+            except Exception as e:
+                print(f'Falha ao finalizar processo {e}')
+                close_w()
+        else:
+            close_w()
+            close_w()
+# ----------------------------------------------------------------------------------------------------------------------
+    def close_mozilla(self):
+     """
+     Fecha o navegador Mozilla Firefox.
+     """
+     try:
+         os.system("taskkill /f /im firefox.exe >nul 2>&1")
+         #time.sleep(2)
+     except Exception as e:
+         print(f"Erro ao tentar fechar o Firefox: {e}")
+# -----------------------------------------------------------------------------------------------------------------------
+    def load_data(self, file_path='dados/filiais_ibama.xls'):
+        """
+        Carrega o arquivo Excel de filiais, padroniza os nomes das colunas e prepara a coluna 'emitido'.
+        Retorna True se carregou com sucesso, False em caso de erro.
+        """
+        try:
+            self.df = pd.read_excel(file_path, engine='xlrd')
+            self.df.columns = self.df.columns.str.strip().str.lower().str.replace(' ', '_')
+            if 'emitido' not in self.df.columns:
+                self.df['emitido'] = 0                            
+            self.df['emitido'] = self.df['emitido'].apply(lambda x: 0 if pd.isna(x) or x == 0 else '')
+            return True
+        except Exception as e:
+            print(f"Erro ao carregar o arquivo xls: {e}")
+            return False
+# ----------------------------------------------------------------------------------------------------------------------
+    def convert_images(self):
+        """
+        Converte todas as imagens da pasta 'images' para escala de cinza e salva com prefixo 'gray_'.
+        """
+        for image in os.listdir('images'):
+            path = os.path.join('images', image)
+            im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            gray_path = os.path.join('images', f'gray_{image}')
+            cv2.imwrite(gray_path, im)
+# ----------------------------------------------------------------------------------------------------------------------
+    def tratamento_cnpj(self, CNPJ):
+        """
+        Remove pontos, barras e traços do CNPJ, retornando apenas os números como string.
+        """
+        try:
+            
+            return str(CNPJ).replace('.', '').replace('/', '').replace('-', '').replace('\\t','').strip()
+        except Exception as e:
+         print(f'[ERROR] Erro ao tratar CNPJ: {e}')
+        return ''
+# ----------------------------------------------------------------------------------------------------------------------
+    def anonimo(self):
+        """
+        Abre uma nova janela anônima no navegador usando atalhos de teclado.
+        """
+        pyautogui.keyDown('ctrl')
+        pyautogui.keyDown('shift')
+        pyautogui.press('n')
+        pyautogui.keyUp('ctrl')
+        pyautogui.keyUp('shift')
+# ----------------------------------------------------------------------------------------------------------------------
+    def reset_ip(self):
+        """
+        Reinicia o IP da máquina usando comandos do Windows.
+        """
+        os.system('ipconfig /release')
+        os.system('ipconfig /renew')
+# ----------------------------------------------------------------------------------------------------------------------
+    def random_sleep(self, flag_hard=False):
+        """
+        Faz uma pausa aleatória curta ou longa, dependendo do parâmetro flag_hard.
+        """
+        if not flag_hard:
+            sleep = random.uniform(random.randint(1, 2), random.randint(3, 4))
+        else:
+            sleep = random.uniform(random.uniform(3, 3.5), random.uniform(3.6, 4))
+        time.sleep(sleep)
+# -----------------------------------------------------------------------------------------------------------------
+    def small_sleep(self):
+        """
+        Faz uma pausa aleatória curta (entre 0.1 e 0.6 segundos).
+        """
+        time.sleep(random.uniform(0.1, 0.6))
+# ---------------------------------------------------------------------------------------------------------------
+    def _copy_link(self):
+        """
+        Copia o link da barra de endereços do navegador para a área de transferência.
+        """
+        pyautogui.press('f6')
+        # self.small_sleep()
+        pyautogui.keyDown('ctrl')
+        # self.small_sleep()
+        pyautogui.press('c')
+        # self.small_sleep()
+        pyautogui.keyUp('ctrl')
+# -------------------------------------------------------------------------------------------------------------------
+    def _paste_text(self):
+        """
+        Copia o link da barra de endereços do navegador para a área de transferência.
+        """    
+        pyautogui.hotkey('ctrl', 'a')  # Seleciona tudo
+        # self.small_sleep()
+        pyautogui.hotkey('ctrl', 'v')  # Cola o novo texto
+# -------------------------------------------------------------------------------------------------------------------
+    def action_goto_page(self, page:str):
+        """
+        Navega para a página informada no navegador, colando o link na barra de endereços e pressionando Enter.
+        """
+        try:
+            pyautogui.press('esc')
+            pyautogui.press('esc')
+            pyautogui.press('f6')
+            # self.small_sleep()
+            pyperclip.copy(page)
+            # self.small_sleep()
+            pyautogui.hotkey('ctrl', 'a')  # Seleciona tudo antes de colar
+            # self.small_sleep()
+            pyautogui.hotkey('ctrl', 'v')  # Cola o link
+            # self.small_sleep()
+            pyautogui.press('enter')
+        except Exception as e:
+            print(f"[Erro] Falha ao acessar página {page}: {e}")
+            self.log.add_log(CNPJ='', message=f'Erro ao acessar página: {e}', tipo='erro', exec_atual=self.path_out_files)
+# ---------------------------------------------------------------------------------------------------------------------
+    def preencher_dados(self, index, tempo, tentativas, emitido, count_captcha):
+        """
+        Preenche os dados de uma filial no DataFrame (self.df) com as informações fornecidas.
+        """
+        self.df.at[index, 'tempo'] = round(tempo, 2)
+        self.df.at[index, 'tentativas'] = tentativas
+        self.df.at[index, 'emitido'] = emitido
+        self.df.at[index, 'captcha'] = count_captcha
+# ---------------------------------------------------------------------------------------------------------------------
+    def save(self):
+        """
+        Salva o DataFrame de filiais (self.df) em um arquivo CSV na pasta de certificados.
+        O arquivo é salvo em <pasta_certificados>/log/log.csv.
+        """
+        file_name = 'log.csv'
+        log_dir = os.path.join(self.path_out_files, 'log')
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, file_name)
+        self.df.to_csv(path, index=False, encoding='utf8')
+# ----------------------------------------------------------------------------------------------------------------
+    def send_keys(self, input, min_sleep=0.001, max_sleep=0.005):
+        """
+        Cola o texto informado no campo ativo usando Ctrl+V.
+        """
+        pyperclip.copy(input)
+        pyautogui.hotkey('ctrl', 'v')
+# -----------------------------------------------------------------------------------------------------------------
+    def identify_login(self, tentativas=3):
+        """
+        Tenta identificar se o login foi realizado com sucesso, atravez de algum icone que garanta que o usuario está logado.
+
+        Retorno : bool
+        -True : Usuario está logado
+         
+        """
+        print('> Identificando captcha: ')
+        elemento = self.map_screen['icon_hcaptcha']
+        flag = False
+
+        for i in range(tentativas):
+            time.sleep(0.5)
+            try:
+                pyautogui.locateOnScreen(elemento, grayscale=True, confidence=0.7)
+                flag = True
+                break
+            except ImageNotFoundException:
+                print(f'login não identificado {i+1}')
+
+        return flag
+# ---------------------------------------------------------------------------------------------------------------------
+      
+if __name__ == "__main__":
+    bot = BotIbamaGui()
+    bot.load_data()
+    # Validação do arquivo de dados
+    dados_path = 'dados/filiais_ibama.xls'
+    if not os.path.exists(dados_path):
+        print(f"[ERRO] Arquivo de dados não encontrado: {dados_path}")
+        print("Por favor, verifique se o arquivo existe na pasta 'dados' e tente novamente.")
+        sys.exit(1)
+    if not bot.load_data(dados_path):
+        print("[ERRO] Falha ao carregar o arquivo de dados.")
+        print("Por favor, verifique se o arquivo está no formato correto e tente novamente.")
+        sys.exit(1)
+    # -------------------------------------------------------------------------------------------------------
+    #  Preparação dos dados
+    # -------------------------------------------------------------------------------------------------------
+    # 1.Seleção das datas pelo usuário
+    app = QApplication(sys.argv)
+    janela = JanelaSelecaoDatas()
+    janela.show()
+    app.exec_()
+    data_inicio = janela.data_inicio
+    data_fim = janela.data_fim
+    print(f"Datas selecionadas: Início: {data_inicio}, Fim: {data_fim}")
+    # -------------------------------------------------------------------------------------------------------
+    # 2. Carregar os cnpjs necessarios para o periodo 
+    dados_path = 'dados/filiais_ibama.xls'
+    if not os.path.exists(dados_path):
+        print(f"[ERRO] Arquivo de dados não encontrado: {dados_path}")
+        sys.exit(1)
+    # -------------------------------------------------------------------------------------------------------
+    # 3. Carregar o arquivo Excel com os dados das filiais
+    bot.df = pd.read_excel(dados_path, engine='xlrd')
+    bot.df.columns = bot.df.columns.str.strip().str.lower().str.replace(' ', '_')
+    bot.df['cnpj'] = bot.df['cnpj'].apply(bot.tratamento_cnpj)
+    if 'emitido' not in bot.df.columns:
+         bot.df['emitido'] = 0
+    
+    
+    # -------------------------------------------------------------------------------------------------------
+    # 4. Verificar se a coluna 'emitido' está presente e padronizar
+    coluna_validade = 'validade_cr'
+    bot.df[coluna_validade] = pd.to_datetime(bot.df[coluna_validade], dayfirst=True, errors='coerce')
+    data_inicio_dt = pd.to_datetime(data_inicio, errors='raise', format='%Y-%m-%d')
+    data_fim_dt = pd.to_datetime(data_fim, errors='raise', format='%Y-%m-%d')
+    # Filtre apenas os que faltam emitir
+    filiais_filtradas = bot.df[
+        (bot.df[coluna_validade] >= pd.to_datetime(data_inicio_dt)) &
+        (bot.df[coluna_validade] <= data_fim_dt)
+        
+    ].copy()
+    
+    # --------------------------------------------------------------------------------------------------------
+    # 5. Verificar se a coluna 'emitido' está presente e padronizar
+    lista_cnpj = []
+    pasta_execucao = f"ref-{data_inicio_dt.strftime('%Y-%m-%d')}"
+    bot.path_out_files = pasta_execucao
+    if not os.path.exists(bot.path_out_files):
+        os.makedirs(bot.path_out_files, exist_ok=True)
+        print(f"Pasta de execução criada: {bot.path_out_files}")
+    else:
+        print(f"Pasta de execução já existe: {bot.path_out_files}. Continuando o processo nesta pasta.")
+        # . Marque como emitido os que já têm PDF na pasta
+        lista_cnpj = [arquivo.replace('.pdf', '') for arquivo in os.listdir(bot.path_out_files) if arquivo.endswith('.pdf')]
+        filiais_filtradas = filiais_filtradas[~filiais_filtradas['cnpj'].isin(lista_cnpj)]
+
+    # --------------------------------------------------------------------------------------------------------
+    # 6. Progresso e início
+    indice_inicio, flag_continuar = bot.verifica_progresso(filiais_filtradas, lista_cnpj)
+
+    # -------------------------------------------------------------------------------------------------------   
+    if flag_continuar:
+        # Inicia a execução 
+        bot.start_mozilla()
+        time.sleep(4)
+        # -------------------------------------------------------------------------------------------------------
+        # 7. Loop para processar cada filial
+        print(f"Iniciando o processamento de {len(filiais_filtradas)} filiais.")
+        print(indice_inicio)
+        print(indice_inicio in filiais_filtradas.index)
+
+        for index, row in filiais_filtradas.loc[indice_inicio:].iterrows():
+            tentativas = 0
+            if bot.flag_stop:
+                break
+            while tentativas < 3:
+                try:
+                    bot.log.add_log(cnpj=row['cnpj'], message='Start')
+                    cnpj = bot.tratamento_cnpj(row['cnpj'])
+                    senha = row['senha']
+
+                    bot.action_goto_page(bot.url_home)
+                    bot.action_login(cnpj, senha)
+                
+
+                    if not bot.identify_login():
+                        bot.log.add_log(cnpj=cnpj, message='captcha')
+                        print("Captcha detectado, aguardando resolução manual...")
+                        while not bot.flag_captcha:
+                            time.sleep(0.1)
+                            print("Aguardando resolução do captcha...")
+                    print("captcha resolvido.")
+                    bot.flag_captcha = False
+
+                    # Realiza 3 tentativas de emitir o certificado
+                
+                    for _ in range(3): 
+                        if bot.action_emitir_certificado():
+                            break
+
+                    bot.dowload_certificado(cnpj)
+                    bot.log.add_log(cnpj=cnpj, message='Certificado baixado com sucesso', tipo='dowload', exec_atual=bot.path_out_files)
+                    emitido = datetime.now().strftime('%d-%m-%Y %H:%M:%S')
+                    bot.df.at[index, 'emitido'] = 1  # Marca a filial como emitida após sucesso
+                    bot.save()
+                    break
+        
+                except DowloadCertificadoException as e:
+                    bot.log.add_log(cnpj=cnpj, message=f'Erro ao baixar o certificado: {e} - tentativa {tentativas}', tipo='aviso', exec_atual=bot.path_out_files)
+                    tentativas += 1
+
+                except FailSafeException as e:
+                    bot.log.add_log(cnpj=cnpj, message=f'foi identificado que foi movido o mouse: {e} - tentativa {tentativas}', tipo='aviso', exec_atual=bot.path_out_files)
+
+                except BotIbamaException as e:
+                    bot.log.add_log(cnpj=cnpj, message=f'tentativa de acessar a filial: {e} - tentativa {tentativas}', tipo='aviso')
+
+                finally:
+                    bot.action_goto_page(bot.url_logout)
+
+                
