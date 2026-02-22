@@ -49,6 +49,7 @@ My main interests include:
 - Artificial Intelligence and Data – *Alura (2025)*
 - Excel Functions and Filters – *Alura (2025)*
 - Computer Networks Fundamentals – *Alura (2025)*
+- Web Development with Gimini AI - *Alura (2025)*
 
 ---
 
